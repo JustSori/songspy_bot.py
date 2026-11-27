@@ -2,11 +2,16 @@ import os
 import re
 import glob
 import json
+import base64
+import time
 import logging
 import sqlite3
 import subprocess
 import urllib.request
+import urllib.parse
 from urllib.parse import quote_plus
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from shazamio import Shazam
@@ -14,6 +19,8 @@ from shazamio import Shazam
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     raise ValueError("BOT_TOKEN را در Environment ست کن")
@@ -29,7 +36,9 @@ con.commit()
 
 pending_query = {}
 pending_link = {}
+PLAYLISTS = {}
 URL_RE = re.compile(r'https?://[^\s]+')
+_sp_token = {"access": None, "exp": 0}
 
 def qp(msg):
     try:
@@ -92,6 +101,50 @@ def platform_of(url: str):
             return "shorts"
         return "youtube"
     return "other"
+
+def parse_spotify_url(url: str):
+    m = re.search(r"open\.spotify\.com/(playlist|album|track)/([A-Za-z0-9]+)", url)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+def get_spotify_token():
+    if time.time() < _sp_token["exp"] - 60 and _sp_token["access"]:
+        return _sp_token["access"]
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    cred = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    req = urllib.request.Request("https://accounts.spotify.com/api/token", data=data, headers={"Authorization": f"Basic {cred}", "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        j = json.loads(r.read().decode())
+        _sp_token["access"] = j["access_token"]
+        _sp_token["exp"] = time.time() + int(j.get("expires_in", 3600))
+        return _sp_token["access"]
+
+def get_playlist_tracks(kind, sid, limit=30):
+    token = get_spotify_token()
+    if not token:
+        return []
+    if kind == "playlist":
+        api = f"https://api.spotify.com/v1/playlists/{sid}/tracks?limit={limit}&offset=0"
+    elif kind == "album":
+        api = f"https://api.spotify.com/v1/albums/{sid}/tracks?limit={limit}&offset=0"
+    else:
+        return []
+    req = urllib.request.Request(api, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        j = json.loads(r.read().decode())
+    tracks = []
+    for it in j.get("items", [])[:limit]:
+        t = it.get("track", it)
+        if not t or not t.get("name"):
+            continue
+        name = t["name"]
+        artists = ", ".join([a["name"] for a in t.get("artists", [])])
+        preview = t.get("preview_url", "")
+        tracks.append({"q": f"{name} {artists}".strip(), "name": name, "artist": artists, "preview": preview})
+    return tracks
 
 def yt_base_cmd():
     cmd = ["yt-dlp"]
@@ -181,29 +234,41 @@ def song_buttons(dl_key: str, title: str, subtitle: str, url_shazam: str):
     q = quote_plus(f"{title} {subtitle}")
     rows = []
     rows.append([InlineKeyboardButton("⬇️ دانلود MP3 🎵", callback_data=f"dl:{dl_key}")])
-    rows.append([
-        InlineKeyboardButton("📝 متن آهنگ", callback_data=f"l:{dl_key}"),
-        InlineKeyboardButton("🔄 اصلاح نام برای ذخیره", callback_data=f"fix:{dl_key}")
-    ])
+    rows.append([InlineKeyboardButton("📝 متن آهنگ", callback_data=f"l:{dl_key}"), InlineKeyboardButton("🔄 اصلاح نام برای ذخیره", callback_data=f"fix:{dl_key}")])
     if url_shazam:
         rows.append([InlineKeyboardButton("🔎 مشاهده در Shazam", url=url_shazam)])
-    rows.append([
-        InlineKeyboardButton("▶️ YouTube", url=f"https://www.youtube.com/results?search_query={q}"),
-        InlineKeyboardButton("🟢 Spotify", url=f"https://open.spotify.com/search/{q}")
-    ])
+    rows.append([InlineKeyboardButton("▶️ YouTube", url=f"https://www.youtube.com/results?search_query={q}"), InlineKeyboardButton("🟢 Spotify", url=f"https://open.spotify.com/search/{q}")])
     return InlineKeyboardMarkup(rows)
+
+def playlist_keyboard(base, page):
+    tracks = PLAYLISTS.get(base, [])
+    per = 5
+    start = page * per
+    chunk = tracks[start:start+per]
+    rows = []
+    for i, t in enumerate(chunk):
+        idx = start + i
+        rows.append([InlineKeyboardButton(f"🎵 {t['name'][:30]} - {t['artist'][:20]}", callback_data=f"pdl:{base}:{idx}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"ppg:{base}:{page-1}"))
+    if start + per < len(tracks):
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"ppg:{base}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+async def send_playlist_page(msg, base, page):
+    tracks = PLAYLISTS.get(base, [])
+    total = len(tracks)
+    txt = f"🎧 پلی‌لیست پیدا شد: {total} ترک ✨\n\nهر کدام را خواستی بزن تا همان یکی دانلود شود 👇\n📄 صفحه {page+1}"
+    await msg.edit_text(txt, reply_markup=playlist_keyboard(base, page))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_user(update.effective_user.id)
     if not await check_join(update, context):
         return
-    txt = (
-        "🎧 به موزیک‌یاب خوش آمدید 👋\n\n"
-        "🎤 ویس، آهنگ یا ویدیو بفرستید تا شناسایی شود\n"
-        "🔎 نام آهنگ را بنویسید تا جست‌وجو شود\n"
-        "🔗 لینک YouTube ،Shorts ،Instagram و Spotify بفرستید تا دانلود شود\n\n"
-        "👀 نکته: تصاویر و ویدیوها به‌صورت محو ارسال می‌شوند؛ برای مشاهده لمس کنید ✨"
-    )
+    txt = "🎧 به موزیک‌یاب خوش آمدید 👋\n\n🎤 ویس، آهنگ یا ویدیو بفرستید تا شناسایی شود\n🔎 نام آهنگ را بنویسید تا جست‌وجو شود\n🔗 لینک YouTube ،Shorts ،Instagram و Spotify بفرستید تا دانلود شود\n🎧 لینک پلی‌لیست اسپاتیفای بفرستید تا لیست ترک‌ها را ببینید\n\n👀 نکته: تصاویر و ویدیوها به‌صورت محو ارسال می‌شوند؛ برای مشاهده لمس کنید ✨"
     await update.message.reply_text(txt, **qp(update.message))
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -325,6 +390,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
     os.makedirs("temp", exist_ok=True)
     base = f"lk_{update.effective_user.id}_{update.message.message_id}"
     if plat == "spotify":
+        kind, sid = parse_spotify_url(url)
+        if kind in ("playlist", "album"):
+            msg = await update.message.reply_text("🎧 پلی‌لیست گرفتم، دارم ترک‌ها را می‌خوانم... ⏳", **qp(update.message))
+            try:
+                tracks = get_playlist_tracks(kind, sid, limit=30)
+            except Exception as e:
+                logger.error(e)
+                tracks = []
+            if not tracks:
+                await msg.edit_text("😕 نتوانستم ترک‌ها را بخوانم. مطمئن شو لینک public باشد و Client ID ست شده باشد.")
+                return
+            PLAYLISTS[base] = tracks
+            await send_playlist_page(msg, base, 0)
+            return
         msg = await update.message.reply_text("🟢 در حال بررسی لینک Spotify... 🔍", **qp(update.message))
         query = spotify_to_query(url)
         if not query:
@@ -345,10 +424,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
     pending_link[base] = url
     mins = f"{dur//60}:{dur%60:02d}" if dur else "—"
     cap = f"🎬 {title}\n👤 {uploader}\n⏱ {mins}\n📎 {label}"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 دانلود ویدیو 👀", callback_data=f"v:{base}")],
-        [InlineKeyboardButton("🎧 دانلود صوت MP3 ⬇️", callback_data=f"a:{base}")]
-    ])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 دانلود ویدیو 👀", callback_data=f"v:{base}")], [InlineKeyboardButton("🎧 دانلود صوت MP3 ⬇️", callback_data=f"a:{base}")]])
     await msg.edit_text(cap, reply_markup=kb)
 
 async def handle_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,6 +502,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     qqp = qp(q.message)
     try:
+        if data.startswith("ppg:"):
+            _, base, pg = data.split(":", 2)
+            await send_playlist_page(q.message, base, int(pg))
+            return
+        if data.startswith("pdl:"):
+            _, base, idx = data.split(":", 2)
+            tracks = PLAYLISTS.get(base, [])
+            t = tracks[int(idx)]
+            query = t["q"]
+            key = f"{base}_{idx}"
+            pending_query[key] = query
+            if t.get("preview"):
+                try:
+                    await context.bot.send_audio(q.message.chat_id, audio=t["preview"], title=t["name"][:60], performer=t["artist"][:60], caption=f"🎵 {t['name']}\n👤 {t['artist']}\n🔎 پیش‌نمایش Spotify", **qqp)
+                except Exception:
+                    pass
+            await q.edit_message_text(f"⏳ در حال دانلود... 🎧\n{query}")
+            ok = await send_cached_or_new_audio(q.message.chat_id, query, context, qqp, want_fix=False)
+            if not ok:
+                qq = quote_plus(query)
+                await context.bot.send_message(q.message.chat_id, f"⚠️ دانلود مستقیم ممکن نشد 📦:\nhttps://www.youtube.com/results?search_query={qq}", **qqp)
+            return
         if data.startswith("l:"):
             key = data[2:]
             query = pending_query.get(key, "")
@@ -455,7 +553,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok = await send_cached_or_new_audio(q.message.chat_id, query, context, qqp, want_fix=is_fix)
             if not ok:
                 qq = quote_plus(query)
-                await context.bot.send_message(q.message.chat_id, f"⚠️ دانلود مستقیم ممکن نشد به‌دلیل حجم بالا 📦:\nhttps://www.youtube.com/results?search_query={qq}", **qqp)
+                await context.bot.send_message(q.message.chat_id, f"⚠️ دانلود مستقیم ممکن نشد 📦:\nhttps://www.youtube.com/results?search_query={qq}", **qqp)
             return
         if data.startswith("v:") or data.startswith("a:"):
             is_audio = data.startswith("a:")
@@ -469,9 +567,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if fid:
                 try:
                     if is_audio:
-                        await context.bot.send_audio(q.message.chat_id, audio=fid, caption="⚡ از کش ارسال شد 🎧", **qqp)
+                        await context.bot.send_audio(q.message.chat_id, audio=fid, **qqp)
                     else:
-                        await context.bot.send_video(q.message.chat_id, video=fid, supports_streaming=True, has_spoiler=True, caption="🎬 برای مشاهده لمس کنید 👀", **qqp)
+                        await context.bot.send_video(q.message.chat_id, video=fid, supports_streaming=True, has_spoiler=True, **qqp)
                     return
                 except Exception:
                     pass
@@ -485,7 +583,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 if is_audio:
                     with open(path, "rb") as f:
-                        sent = await context.bot.send_audio(q.message.chat_id, audio=f, caption="🎧 بفرمایید 🎵", **qqp)
+                        sent = await context.bot.send_audio(q.message.chat_id, audio=f, **qqp)
                     try:
                         if sent.audio:
                             cache_set(ckey, sent.audio.file_id, "audio")
@@ -518,6 +616,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+def keep_alive():
+    port = int(os.getenv("PORT", "10000"))
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *a):
+            pass
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -530,11 +639,14 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_router))
     PORT = int(os.getenv("PORT", "10000"))
-    URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    URL = (os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("WEBHOOK_URL", "")).rstrip("/")
     if URL:
+        print(f"Running with webhook: {URL}")
         app.run_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=f"{URL}/{BOT_TOKEN}")
     else:
-        app.run_polling()
+        print("Running with polling + dummy port...")
+        Thread(target=keep_alive, daemon=True).start()
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
