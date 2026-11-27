@@ -4,4 +4,4 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "songspyfinal.py"]
+CMD ["sh", "-c", "ls -la; python songspyfinal.py || python songspyemoji.py || python main.py || python bot.py"]
