@@ -34,7 +34,7 @@ URL_RE = re.compile(r'https?://[^\s]+')
 
 def qp(msg):
     try:
-        return {"reply_parameters": ReplyParameters(message_id=msg.message_id, quote=True)}
+        return {"reply_parameters": ReplyParameters(message_id=msg.message_id, allow_sending_without_reply=True)}
     except Exception:
         return {}
 
@@ -377,6 +377,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await context.bot.send_message(q.message.chat_id, "😕 متن پیدا نشد", **qp(q.message))
 
+async def on_error(update, context):
+    logger.exception("Handler error:", exc_info=context.error)
+
 def keep_alive():
     port = int(os.getenv("PORT", "10000"))
     class H(BaseHTTPRequestHandler):
@@ -389,7 +392,7 @@ def keep_alive():
     HTTPServer(("0.0.0.0", port), H).serve_forever()
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(60).write_timeout(60).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("stats", stats))
@@ -397,6 +400,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_song))
+    app.add_error_handler(on_error)
     PORT = int(os.getenv("PORT", "10000"))
     URL = (os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("WEBHOOK_URL", "")).rstrip("/")
     if URL:
